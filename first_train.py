@@ -26,9 +26,11 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (average_precision_score, brier_score_loss,
-                             confusion_matrix, roc_auc_score)
+from sklearn.metrics import (accuracy_score, average_precision_score,
+                             brier_score_loss, confusion_matrix, f1_score,
+                             roc_auc_score)
 from sklearn.naive_bayes import GaussianNB
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PowerTransformer, QuantileTransformer, StandardScaler
@@ -38,7 +40,7 @@ from sklearn.preprocessing import PowerTransformer, QuantileTransformer, Standar
 # =============================================================================
 CONFIG = dict(
     table="full_table.csv",          # tabulka z build_full_table.py
-    level=16,                         # 4, 8 alebo 16  (ktora feature mapa)
+    level=8,                         # 4, 8 alebo 16  (ktora feature mapa)
     # Statistiky pocitane cez poziciu pre kazdy z 48 kanalov. Dostupne:
     #   mean, std, min, max, absmean, p05, p25, p50, p75, p95, energy, skew, kurt
     stats=["mean", "std", "min", "max", "absmean"],
@@ -47,7 +49,13 @@ CONFIG = dict(
     #   "quantile"  - QuantileTransformer -> normalne rozdelenie (dobre pre naive Bayes)
     #   "power"     - PowerTransformer (Yeo-Johnson)
     #   "none"      - ziadna
-    scaling="standard",
+    scaling="quantile",
+    # Na kolko casovych useku sa mapa rozdeli pred agregaciou (1 = cela mapa naraz).
+    # Pri 10 usekoch je priznakov 10x viac (48 kanalov x n_stats x 10), ale zostane
+    # hruba informacia o tom, KDE v signali sa priznak nachadza.
+    n_segments=1,
+    # Ktore modely spustit (nazvy z make_models); None = vsetky.
+    models=None,
     pca_components=None,             # napr. 20 alebo 0.95 (podiel variancie); None = bez PCA
     train_folds=list(range(1, 9)),   # 1-8 trenovanie
     val_fold=9,                      # 9 validacia
@@ -71,7 +79,19 @@ def make_models(seed):
         "logreg_C0.1": LogisticRegression(C=0.1, max_iter=2000, class_weight="balanced"),
         "logreg_C0.01": LogisticRegression(C=0.01, max_iter=2000, class_weight="balanced"),
         "gaussian_nb": GaussianNB(),
+        # Nelinearny model; na skalovanie je necitlivy. Pri tisickach priznakov je pomalsi.
+        "hist_gb": HistGradientBoostingClassifier(
+            max_iter=300, learning_rate=0.05, max_leaf_nodes=15, l2_regularization=1.0,
+            early_stopping=True, validation_fraction=0.1, n_iter_no_change=20,
+            class_weight="balanced", random_state=seed),
     }
+
+
+def selected_models(cfg):
+    ms = make_models(cfg["seed"])
+    if cfg["models"]:
+        ms = {k: v for k, v in ms.items() if k in cfg["models"]}
+    return ms
 
 
 # =============================================================================
@@ -106,8 +126,10 @@ def _stat(a, name):
     raise ValueError(f"Neznama statistika: {name}")
 
 
-def aggregate(a, stats):
-    return np.concatenate([_stat(a, s) for s in stats]).astype(np.float32)
+def aggregate(a, stats, n_seg=1):
+    """(48, L) -> vektor. Mapa sa najprv rozdeli na n_seg useku po osi poziciu."""
+    parts = np.array_split(a, n_seg, axis=1)
+    return np.concatenate([_stat(p, s) for p in parts for s in stats]).astype(np.float32)
 
 
 def feature_names(stats, n_ch=48):
@@ -134,7 +156,8 @@ def resolve_path(row, col, cfg):
 
 def build_features(df, cfg):
     col = f"path_to_feature_map_lvl_{cfg['level']}"
-    key = hashlib.md5(("|".join(cfg["stats"]) + str(len(df))).encode()).hexdigest()[:8]
+    seg = f"|seg{cfg['n_segments']}" if cfg["n_segments"] > 1 else ""  # n_segments=1 -> stary cache plati
+    key = hashlib.md5(("|".join(cfg["stats"]) + str(len(df)) + seg).encode()).hexdigest()[:8]
     os.makedirs(cfg["cache_dir"], exist_ok=True)
     cache = os.path.join(cfg["cache_dir"], f"features_lvl{cfg['level']}_{key}.npz")
     if os.path.exists(cache):
@@ -143,12 +166,12 @@ def build_features(df, cfg):
             print(f"[cache] nacitane {cache}")
             return z["X"], z["ok"]
 
-    X = np.full((len(df), 48 * len(cfg["stats"])), np.nan, dtype=np.float32)
+    X = np.full((len(df), 48 * len(cfg["stats"]) * cfg["n_segments"]), np.nan, dtype=np.float32)
     ok = np.zeros(len(df), dtype=bool)
     t0 = time.time()
     for i, (_, row) in enumerate(df.iterrows()):
         try:
-            X[i] = aggregate(load_map(resolve_path(row, col, cfg)), cfg["stats"])
+            X[i] = aggregate(load_map(resolve_path(row, col, cfg)), cfg["stats"], cfg["n_segments"])
             ok[i] = True
         except Exception as e:  # chybajuci/poskodeny subor nezhodi cely beh
             if (~ok).sum() <= 5:
@@ -183,6 +206,8 @@ def metrics(y, p, thr=0.5):
     return dict(
         roc_auc=roc_auc_score(y, p),
         pr_auc=average_precision_score(y, p),
+        f1=f1_score(y, pred, zero_division=0),
+        acc=accuracy_score(y, pred),
         sens=tp / max(tp + fn, 1),
         spec=tn / max(tn + fp, 1),
         brier=brier_score_loss(y, p),
@@ -206,7 +231,7 @@ def run_holdout(df, X, cfg, eval_fold, label):
     ev = (df.strat_fold == eval_fold).values
     y = df.y.values
     out = {}
-    for name, model in make_models(cfg["seed"]).items():
+    for name, model in selected_models(cfg).items():
         pipe = make_pipeline(model, cfg).fit(X[tr], y[tr])
         p_tr = pipe.predict_proba(X[tr])[:, 1]
         p = pipe.predict_proba(X[ev])[:, 1]
@@ -215,18 +240,19 @@ def run_holdout(df, X, cfg, eval_fold, label):
         m["train_auc"] = roc_auc_score(y[tr], p_tr)
         out[name] = m
     print(f"\n=== {label} (fold {eval_fold}, n={ev.sum()}, infarktov={y[ev].sum()}) ===")
-    print("prah = Youden na trenovacich datach; train_auc vs roc_auc ukazuje pretrenovanie")
+    print("prah = Youden na trenovacich datach (f1, acc, sens, spec zavisia od prahu);")
+    print("train_auc vs roc_auc ukazuje pretrenovanie")
     print(fmt(out))
     return out
 
 
 def run_cv(df, X, cfg):
     y = df.y.values
-    rows = {n: [] for n in make_models(cfg["seed"])}
+    rows = {n: [] for n in selected_models(cfg)}
     for k in cfg["cv_folds"]:
         tr = df.strat_fold.isin([f for f in cfg["cv_folds"] if f != k]).values
         ev = (df.strat_fold == k).values
-        for name, model in make_models(cfg["seed"]).items():
+        for name, model in selected_models(cfg).items():
             pipe = make_pipeline(model, cfg).fit(X[tr], y[tr])
             p = pipe.predict_proba(X[ev])[:, 1]
             rows[name].append([roc_auc_score(y[ev], p), average_precision_score(y[ev], p)])
@@ -246,6 +272,8 @@ def main():
     ap.add_argument("--table"); ap.add_argument("--level", type=int)
     ap.add_argument("--stats", help="napr. mean,std,min,max")
     ap.add_argument("--scaling"); ap.add_argument("--pca", type=float)
+    ap.add_argument("--segments", type=int, help="pocet casovych useku mapy")
+    ap.add_argument("--models", help="napr. logreg_C0.1,hist_gb")
     ap.add_argument("--cv", action="store_true", help="krizova validacia cez foldy 1-9")
     ap.add_argument("--final-test", action="store_true",
                     help="vyhodnotenie na teste (fold 10) - pouzi az na konci")
@@ -255,12 +283,16 @@ def main():
     if a.level: cfg["level"] = a.level
     if a.stats: cfg["stats"] = a.stats.split(",")
     if a.scaling: cfg["scaling"] = a.scaling
+    if a.segments: cfg["n_segments"] = a.segments
+    if a.models: cfg["models"] = a.models.split(",")
     if a.pca: cfg["pca_components"] = int(a.pca) if a.pca >= 1 else a.pca
     warnings.filterwarnings("ignore")
 
     df = pd.read_csv(cfg["table"])
-    print(f"lvl={cfg['level']} stats={cfg['stats']} scaling={cfg['scaling']} pca={cfg['pca_components']}")
+    print(f"lvl={cfg['level']} stats={cfg['stats']} segments={cfg['n_segments']} "
+          f"scaling={cfg['scaling']} pca={cfg['pca_components']}")
     X, ok = build_features(df, cfg)
+    print(f"tvar X: {X.shape}")
     if not ok.all():
         print(f"[!] {(~ok).sum()} EKG sa nepodarilo nacitat - vynechane")
         df, X = df[ok].reset_index(drop=True), X[ok]
