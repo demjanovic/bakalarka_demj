@@ -6,10 +6,10 @@ Z kazdej mapy sa agregaciou cez poziciu (os L) spravi vektor priznakov na EKG:
 48 kanalov x n_statistik.
 
 Pouzitie (Windows, mapy na disku E:):
-    python train_baseline.py                   # nastavenia z bloku CONFIG nizsie
-    python train_baseline.py --level 8         # prepisanie z prikazoveho riadka
-    python train_baseline.py --level 4 --cv    # krizova validacia cez foldy 1-9
-    python train_baseline.py --final-test      # az na konci: vyhodnotenie na foldu 10
+    python first_train.py                   # nastavenia z bloku CONFIG nizsie
+    python first_train.py --level 8         # prepisanie z prikazoveho riadka
+    python first_train.py --level 4 --cv    # krizova validacia cez foldy 1-9
+    python first_train.py --final-test      # az na konci: vyhodnotenie na foldu 10
 
 Priznaky sa raz vypocitaju a ulozia do cache (features_lvl{N}_{stats}.npz), dalsie
 behy su rychle - modely a nastavenia mozes menit bez opatovneho nacitania 30 GB.
