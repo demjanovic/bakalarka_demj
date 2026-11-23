@@ -6,10 +6,10 @@ Z kazdej mapy sa agregaciou cez poziciu (os L) spravi vektor priznakov na EKG:
 48 kanalov x n_statistik.
 
 Pouzitie (Windows, mapy na disku E:):
-    python first_train.py                   # nastavenia z bloku CONFIG nizsie
-    python first_train.py --level 8         # prepisanie z prikazoveho riadka
-    python first_train.py --level 4 --cv    # krizova validacia cez foldy 1-9
-    python first_train.py --final-test      # az na konci: vyhodnotenie na foldu 10
+    python train_baseline.py                   # nastavenia z bloku CONFIG nizsie
+    python train_baseline.py --level 8         # prepisanie z prikazoveho riadka
+    python train_baseline.py --level 4 --cv    # krizova validacia cez foldy 1-9
+    python train_baseline.py --final-test      # az na konci: vyhodnotenie na foldu 10
 
 Priznaky sa raz vypocitaju a ulozia do cache (features_lvl{N}_{stats}.npz), dalsie
 behy su rychle - modely a nastavenia mozes menit bez opatovneho nacitania 30 GB.
@@ -40,10 +40,10 @@ from sklearn.preprocessing import PowerTransformer, QuantileTransformer, Standar
 # =============================================================================
 CONFIG = dict(
     table="full_table.csv",          # tabulka z build_full_table.py
-    level=8,                         # 4, 8 alebo 16  (ktora feature mapa)
+    level=4,                         # 4, 8 alebo 16  (ktora feature mapa)
     # Statistiky pocitane cez poziciu pre kazdy z 48 kanalov. Dostupne:
     #   mean, std, min, max, absmean, p05, p25, p50, p75, p95, energy, skew, kurt
-    stats=["mean", "std", "min", "max", "absmean"],
+    stats=["mean", "std", "min", "max", "absmean", "energy"],
     # Uprava priznakov pred modelom:
     #   "standard"  - StandardScaler (z-skore)
     #   "quantile"  - QuantileTransformer -> normalne rozdelenie (dobre pre naive Bayes)
@@ -79,6 +79,11 @@ def make_models(seed):
         "logreg_C0.1": LogisticRegression(C=0.1, max_iter=2000, class_weight="balanced"),
         "logreg_C0.01": LogisticRegression(C=0.01, max_iter=2000, class_weight="balanced"),
         "gaussian_nb": GaussianNB(),
+        # NB predpoklada nezavisle priznaky; statistiky (std, absmean, energy) su silne
+        # korelovane -> PCA ich dekoreluje. 40 komponentov vybrane cez CV foldy 1-9 na lvl 4
+        # (plato 30-60; AUC 0.643 -> 0.744).
+        "gaussian_nb_pca40": Pipeline([("pca", PCA(n_components=40, random_state=seed)),
+                                       ("nb", GaussianNB())]),
         # Nelinearny model; na skalovanie je necitlivy. Pri tisickach priznakov je pomalsi.
         "hist_gb": HistGradientBoostingClassifier(
             max_iter=300, learning_rate=0.05, max_leaf_nodes=15, l2_regularization=1.0,
@@ -169,12 +174,14 @@ def build_features(df, cfg):
     X = np.full((len(df), 48 * len(cfg["stats"]) * cfg["n_segments"]), np.nan, dtype=np.float32)
     ok = np.zeros(len(df), dtype=bool)
     t0 = time.time()
+    n_err = 0
     for i, (_, row) in enumerate(df.iterrows()):
         try:
             X[i] = aggregate(load_map(resolve_path(row, col, cfg)), cfg["stats"], cfg["n_segments"])
             ok[i] = True
         except Exception as e:  # chybajuci/poskodeny subor nezhodi cely beh
-            if (~ok).sum() <= 5:
+            n_err += 1
+            if n_err <= 5:
                 print(f"  [!] ecg_id={row['ecg_id']}: {type(e).__name__}: {e}")
         if (i + 1) % 1000 == 0:
             print(f"  {i + 1}/{len(df)}  ({time.time() - t0:.0f}s)")
@@ -243,27 +250,51 @@ def run_holdout(df, X, cfg, eval_fold, label):
     print("prah = Youden na trenovacich datach (f1, acc, sens, spec zavisia od prahu);")
     print("train_auc vs roc_auc ukazuje pretrenovanie")
     print(fmt(out))
+    os.makedirs(cfg["cache_dir"], exist_ok=True)
+    f = os.path.join(cfg["cache_dir"], f"holdout_lvl{cfg['level']}_fold{eval_fold}.csv")
+    pd.DataFrame(out).T.rename_axis("model").reset_index().to_csv(f, index=False)
+    print(f"[ulozene] {f}")
     return out
 
 
 def run_cv(df, X, cfg):
+    """k-nasobna krizova validacia cez cv_folds (default foldy 1-9; fold 10 ostava nedotknuty).
+    V kazdom kole sa jeden fold pouzije na vyhodnotenie a ostatne na trenovanie.
+    Prah pre f1/acc/sens/spec sa hlada na trenovacich foldoch (ako pri bezne validacii)."""
     y = df.y.values
-    rows = {n: [] for n in selected_models(cfg)}
+    metric_cols = ["roc_auc", "pr_auc", "f1", "acc", "sens", "spec"]
+    per_fold = []                                  # jeden riadok na (model, fold)
     for k in cfg["cv_folds"]:
         tr = df.strat_fold.isin([f for f in cfg["cv_folds"] if f != k]).values
         ev = (df.strat_fold == k).values
         for name, model in selected_models(cfg).items():
             pipe = make_pipeline(model, cfg).fit(X[tr], y[tr])
+            p_tr = pipe.predict_proba(X[tr])[:, 1]
             p = pipe.predict_proba(X[ev])[:, 1]
-            rows[name].append([roc_auc_score(y[ev], p), average_precision_score(y[ev], p)])
+            thr = 0.5 if name.startswith("dummy") else youden_threshold(y[tr], p_tr)
+            m = metrics(y[ev], p, thr)
+            per_fold.append(dict(model=name, fold=k, **{c: m[c] for c in metric_cols}))
+        print(f"  fold {k} hotovy")
+    pf = pd.DataFrame(per_fold)
+
     print(f"\n=== Krizova validacia cez foldy {cfg['cv_folds']} (lvl {cfg['level']}) ===")
-    res = {}
-    for n, r in rows.items():
-        r = np.array(r)
-        res[n] = dict(roc_auc_mean=r[:, 0].mean(), roc_auc_std=r[:, 0].std(),
-                      pr_auc_mean=r[:, 1].mean(), pr_auc_std=r[:, 1].std())
-    print(fmt(res))
-    return res
+    print("priemer +- smerodajna odchylka cez foldy; prah = Youden na trenovacich foldoch")
+    summary = {}
+    for name, g in pf.groupby("model", sort=False):
+        summary[name] = {c: f"{g[c].mean():.3f} +- {g[c].std(ddof=1):.3f}" for c in metric_cols}
+    print(pd.DataFrame(summary).T.to_string())
+
+    print("\nVysledky po foldoch (roc_auc / f1):")
+    for c in ("roc_auc", "f1"):
+        print(f"\n{c}:")
+        print(pf.pivot(index="model", columns="fold", values=c)
+                .loc[list(summary)].round(3).to_string())
+
+    os.makedirs(cfg["cache_dir"], exist_ok=True)
+    out = os.path.join(cfg["cache_dir"], f"cv_lvl{cfg['level']}.csv")
+    pf.to_csv(out, index=False)
+    print(f"\n[ulozene] {out}")
+    return summary
 
 
 # =============================================================================

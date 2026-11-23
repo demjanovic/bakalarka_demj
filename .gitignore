@@ -3,3 +3,5 @@ cache/
 *.npz
 ptbxl_database.csv
 __pycache__/
+cnn_runs/
+*.npy
